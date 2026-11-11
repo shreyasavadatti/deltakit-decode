@@ -1,6 +1,7 @@
 # (c) Copyright Riverlane 2020-2026. All rights reserved.
 
 import math
+import warnings
 from pathlib import Path
 from unittest import mock
 
@@ -14,6 +15,7 @@ from deltakit_core.decoding_graphs import (
 from pytest_lazy_fixtures import lf
 
 from deltakit_decode.utils import (
+    PijEstimationWarning,
     calculate_pij_values,
     create_dem_from_pij,
     dem_and_pij_edges_max_diff,
@@ -2387,3 +2389,171 @@ class TestDerivationToolsPij:
         graph, _ = dem_to_hypergraph_and_logicals(noise_floor_dem)
         pij_data = calculate_pij_values(exp_data, noise_floor_graph=graph, max_degree=3)
         assert pij_data == exp_pij_values
+
+    @pytest.mark.parametrize(
+        ("exp_data", "reason"),
+        [
+            # (1-2*0.6)(1-2*0.1) < 0 over a positive denominator, so the
+            # radicand is negative and has no real square root.
+            ({(0,): 0.6, (1,): 0.1, (0, 1): 0.2}, "negative radicand"),
+            # 1 - 2*0.5 - 2*0.1 + 4*0.05 == 0, so the ratio is undefined.
+            ({(0,): 0.5, (1,): 0.1, (0, 1): 0.05}, "zero denominator"),
+        ],
+    )
+    def test_calculate_pij_values_warns_instead_of_raising_when_estimate_undefined(
+        self, exp_data, reason
+    ):
+        exp_data = {frozenset(x): p for x, p in exp_data.items()}
+        with pytest.warns(UserWarning, match=r".* had no real Pij estimate .*"):
+            pij_data = calculate_pij_values(exp_data)
+        assert pij_data[frozenset((0, 1))] == -math.inf, reason
+
+    def test_calculate_pij_values_floors_undefined_estimate_to_min_prob(self):
+        exp_data = {
+            frozenset(x): p for x, p in {(0,): 0.6, (1,): 0.1, (0, 1): 0.2}.items()
+        }
+        with pytest.warns(UserWarning, match=r".* had no real Pij estimate .*"):
+            pij_data = calculate_pij_values(exp_data, min_prob=0.0)
+        assert pij_data[frozenset((0, 1))] == 0.0
+
+    def test_calculate_pij_values_does_not_warn_for_well_conditioned_data(
+        self, recwarn
+    ):
+        exp_data = {
+            frozenset(x): p for x, p in {(0,): 0.1, (1,): 0.1, (0, 1): 0.05}.items()
+        }
+        pij_data = calculate_pij_values(exp_data)
+        assert all(math.isfinite(p) for p in pij_data.values())
+        assert len(recwarn) == 0
+
+    def test_calculate_pij_values_handles_degree_1_edge_missing_from_exp_values(self):
+        dem = stim.DetectorErrorModel(
+            "\n".join(
+                [
+                    "error(0.05) D0",
+                    "error(0.06) D1",
+                    "detector(1,0,0) D0",
+                    "detector(2,0,0) D1",
+                ]
+            )
+        )
+        graph, _ = dem_to_decoding_graph_and_logicals(dem)
+        exp_data = {frozenset((1,)): 0.1}
+        pij_data = calculate_pij_values(exp_data, graph)
+        assert pij_data[frozenset((0,))] == 0.0
+
+    @pytest.mark.parametrize(
+        "bad_value",
+        [-0.1, 1.5, math.nan, -math.inf],
+    )
+    def test_create_dem_from_pij_raises_on_invalid_probability(self, bad_value):
+        dem = stim.DetectorErrorModel(
+            "\n".join(
+                [
+                    "error(0.05) D0",
+                    "error(0.06) D1",
+                    "detector(1,0,0) D0",
+                    "detector(2,0,0) D1",
+                ]
+            )
+        )
+        graph, logicals = dem_to_decoding_graph_and_logicals(dem)
+        pij_data = {frozenset((0,)): 0.05, frozenset((1,)): bad_value}
+        with pytest.raises(
+            ValueError,
+            match=r".* edge probabilities are undefined or outside \[0, 1\].*",
+        ):
+            create_dem_from_pij(pij_data, graph, logicals)
+
+    def test_create_dem_from_pij_accepts_valid_probabilities(self):
+        dem = stim.DetectorErrorModel(
+            "\n".join(
+                [
+                    "error(0.05) D0",
+                    "error(0.06) D1",
+                    "detector(1,0,0) D0",
+                    "detector(2,0,0) D1",
+                ]
+            )
+        )
+        graph, logicals = dem_to_decoding_graph_and_logicals(dem)
+        pij_data = {frozenset((0,)): 0.05, frozenset((1,)): 0.06}
+        assert create_dem_from_pij(pij_data, graph, logicals) is not None
+
+    def test_calculate_pij_values_warns_when_negative_estimate_clamped_to_zero(self):
+        exp_data = {
+            frozenset(x): p for x, p in {(0,): 0.1, (1,): 0.1, (0, 1): 0.005}.items()
+        }
+        with pytest.warns(UserWarning, match=r".* raised to exactly zero.*"):
+            pij_data = calculate_pij_values(exp_data, min_prob=0.0)
+        assert pij_data[frozenset((0, 1))] == 0.0
+
+    def test_calculate_pij_values_does_not_warn_when_floor_is_above_zero(self, recwarn):
+        exp_data = {
+            frozenset(x): p for x, p in {(0,): 0.1, (1,): 0.1, (0, 1): 0.005}.items()
+        }
+        calculate_pij_values(exp_data, min_prob=0.05)
+        assert len(recwarn) == 0
+
+    def test_pij_estimation_warning_is_importable_and_filterable(self):
+        exp_data = {
+            frozenset(x): p for x, p in {(0,): 0.1, (1,): 0.1, (0, 1): 0.005}.items()
+        }
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", PijEstimationWarning)
+            with pytest.raises(PijEstimationWarning):
+                calculate_pij_values(exp_data, min_prob=0.0)
+
+    def test_low_shot_pipeline_end_to_end_reports_rather_than_crashes(
+        self, stim_circuit: stim.Circuit
+    ):
+        # The full samples -> expectation -> Pij -> DEM path at a low shot
+        # count. Previously this raised math domain error inside the
+        # estimator, or built a DEM from out-of-range probabilities.
+        dem = stim_circuit.detector_error_model(decompose_errors=True)
+        graph, logicals = dem_to_decoding_graph_and_logicals(dem)
+        sampler = stim_circuit.compile_detector_sampler(seed=7)
+        samples = [
+            [i for i, bit in enumerate(row) if bit] for row in sampler.sample(200)
+        ]
+        exp_data = generate_expectation_data(samples, max_degree=2)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            pij_data = calculate_pij_values(exp_data, graph)
+
+        # At this shot count the estimator produces out-of-range values for a
+        # subset of edges. Previously those reached EdgeRecord unchecked.
+        assert any(not 0.0 <= p <= 1.0 for p in pij_data.values())
+        with pytest.raises(ValueError, match=r".*outside \[0, 1\].*"):
+            create_dem_from_pij(pij_data, graph, logicals)
+
+    def test_calculate_pij_values_populates_diagnostics_when_requested(self):
+        exp_data = {
+            frozenset(x): p for x, p in {(0,): 0.1, (1,): 0.1, (0, 1): 0.005}.items()
+        }
+        diagnostics: dict = {}
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            calculate_pij_values(exp_data, min_prob=0.0, diagnostics=diagnostics)
+        assert set(diagnostics) == {"undefined", "clamped", "zero_clamped"}
+        assert frozenset((0, 1)) in diagnostics["clamped"]
+        assert frozenset((0, 1)) in diagnostics["zero_clamped"]
+        assert diagnostics["undefined"] == set()
+
+    def test_calculate_pij_values_diagnostics_record_nonzero_floor_clamps(self):
+        exp_data = {
+            frozenset(x): p for x, p in {(0,): 0.1, (1,): 0.1, (0, 1): 0.005}.items()
+        }
+        diagnostics: dict = {}
+        calculate_pij_values(exp_data, min_prob=0.05, diagnostics=diagnostics)
+        assert frozenset((0, 1)) in diagnostics["clamped"]
+        assert diagnostics["zero_clamped"] == set()
+
+    def test_calculate_pij_values_diagnostics_empty_for_well_conditioned_data(self):
+        exp_data = {
+            frozenset(x): p for x, p in {(0,): 0.1, (1,): 0.1, (0, 1): 0.05}.items()
+        }
+        diagnostics: dict = {}
+        calculate_pij_values(exp_data, diagnostics=diagnostics)
+        assert all(v == set() for v in diagnostics.values())

@@ -7,6 +7,7 @@ from deltakit_decode.utils._derivation_tools import (
     generate_expectation_data,
 )
 from deltakit_decode.utils._derivation_tools_pij import (
+    PijEstimationWarning,
     calculate_pij_values,
     create_dem_from_pij,
     dem_and_pij_edges_max_diff,

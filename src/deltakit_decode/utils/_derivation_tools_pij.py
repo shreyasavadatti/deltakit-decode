@@ -1,6 +1,7 @@
 # (c) Copyright Riverlane 2020-2026. All rights reserved.
 
 import math
+import warnings
 from collections.abc import Callable
 from itertools import combinations
 
@@ -24,6 +25,121 @@ from deltakit_decode.utils._derivation_tools import (
 )
 
 PijData = dict[frozenset[int], float]
+
+
+class PijEstimationWarning(UserWarning):
+    """Warn when finite-shot Pij estimates are undefined or clamped."""
+
+
+def _safe_root(numerator: float, denominator: float, exponent: float) -> float:
+    """Return (numerator / denominator) ** exponent, or nan when undefined.
+
+    Finite-shot expectation data can drive the ratio negative or the
+    denominator to zero, neither of which has a real root.
+
+    Args:
+        numerator: Numerator of the ratio.
+        denominator: Denominator of the ratio.
+        exponent: Exponent to apply to the ratio.
+
+    Returns:
+        The rooted ratio, or nan if it is not defined over the reals.
+    """
+    if denominator == 0.0:
+        return math.nan
+    ratio = numerator / denominator
+    if not math.isfinite(ratio) or ratio < 0.0:
+        return math.nan
+    return math.pow(ratio, exponent)
+
+
+def _apply_floor(
+    value: float,
+    floor: float,
+    key: frozenset[int],
+    undefined: set[frozenset[int]],
+    zero_clamped: set[frozenset[int]],
+    clamped: set[frozenset[int]],
+) -> float:
+    """Apply the floor to a Pij estimate, recording undefined and zeroed edges.
+
+    Args:
+        value: The estimated Pij value, possibly nan.
+        floor: The floor to apply.
+        key: The edge this value belongs to.
+        undefined: Accumulates edges whose estimate was not defined.
+        zero_clamped: Accumulates edges raised to exactly zero, which carry an
+            infinite matching weight and so cannot be told apart from an edge
+            that genuinely cannot occur.
+        clamped: Accumulates every edge raised to the floor, zeroed or not.
+
+    Returns:
+        The floored value.
+    """
+    if math.isnan(value):
+        undefined.add(key)
+        if floor == 0.0:
+            zero_clamped.add(key)
+        return floor
+
+    floored = max(floor, value)
+    if floored > value:
+        clamped.add(key)
+        if floored == 0.0:
+            zero_clamped.add(key)
+    return floored
+
+
+def _record_pij_diagnostics(
+    diagnostics: dict[str, set[frozenset[int]]] | None,
+    undefined: set[frozenset[int]],
+    clamped: set[frozenset[int]],
+    zero_clamped: set[frozenset[int]],
+) -> None:
+    """Populate the caller's diagnostics mapping, if one was given.
+
+    Args:
+        diagnostics: The caller's mapping, or None to record nothing.
+        undefined: Edges whose estimate was not defined over the reals.
+        clamped: Edges raised to the floor, zeroed or not.
+        zero_clamped: Edges raised to exactly zero.
+    """
+    if diagnostics is None:
+        return
+    diagnostics["undefined"] = undefined
+    diagnostics["clamped"] = clamped
+    diagnostics["zero_clamped"] = zero_clamped
+
+
+def _warn_pij_diagnostics(
+    undefined: set[frozenset[int]],
+    zero_clamped: set[frozenset[int]],
+) -> None:
+    """Warn about edges whose Pij estimate is undefined or was zeroed.
+
+    Args:
+        undefined: Edges whose estimate was not defined over the reals.
+        zero_clamped: Edges raised to exactly zero from a lower estimate.
+    """
+    if zero_clamped:
+        warnings.warn(
+            f"{len(zero_clamped)} edge(s) were raised to exactly zero, e.g. "
+            f"{sorted(sorted(e) for e in zero_clamped)[:3]}. A zero probability "
+            "gives an infinite matching weight, so these cannot be told apart "
+            "from edges that genuinely cannot occur.",
+            PijEstimationWarning,
+            stacklevel=3,
+        )
+    if not undefined:
+        return
+    warnings.warn(
+        f"{len(undefined)} edge(s) had no real Pij estimate from the given "
+        f"expectation data and were set to the floor value, e.g. "
+        f"{sorted(sorted(e) for e in undefined)[:3]}. This usually means "
+        "the shot count is too low for these edges.",
+        PijEstimationWarning,
+        stacklevel=3,
+    )
 
 
 def _calculate_pij_degree_2(
@@ -52,7 +168,7 @@ def _calculate_pij_degree_2(
 
     denominator = _d1_formula(exp_values, [key])
 
-    return 0.5 - 0.5 * math.sqrt(numerator / denominator)
+    return 0.5 - 0.5 * _safe_root(numerator, denominator, 0.5)
 
 
 def _calculate_pij_degree_3(
@@ -83,7 +199,7 @@ def _calculate_pij_degree_3(
 
     d1 = _d1_formula(exp_values, key_combinations)
 
-    inner_b = math.pow(((n1 * n2) / d1), 0.25)
+    inner_b = _safe_root(n1 * n2, d1, 0.25)
 
     return 0.5 * (1 - inner_b)
 
@@ -128,7 +244,7 @@ def _calculate_pij_degree_4(
         + (16 * exp_values.get(key, 0.0))
     )
 
-    inner_b = math.pow((n1 * n2) / (d1 * d2), 1 / 8)
+    inner_b = _safe_root(n1 * n2, d1 * d2, 1 / 8)
     return 0.5 * (1 - inner_b)
 
 
@@ -153,6 +269,7 @@ def calculate_pij_values(
     min_prob: float = -math.inf,
     max_degree: int = 2,
     noise_floor_graph: NXDecodingGraph | DecodingHyperGraph | None = None,
+    diagnostics: dict[str, set[frozenset[int]]] | None = None,
 ) -> PijData:
     """Calculates the Pij values given the <Xi> <Xj> etc values.
     At most degree 4 edges are supported.
@@ -192,6 +309,14 @@ def calculate_pij_values(
         the values will instead be compared against min_prob.
         Noise floor graph likely generated from a noise model.
         Default value is None.
+    diagnostics : Optional[Dict[str, Set[FrozenSet[int]]]], optional
+        If a dictionary is passed, it is populated with the keys "undefined",
+        "clamped" and "zero_clamped", each mapping to the set of edges in that
+        category. "undefined" edges had no real estimate for the given
+        expectation data. "clamped" edges were raised to the floor, whether by
+        min_prob or by noise_floor_graph. "zero_clamped" edges were raised to
+        exactly zero, and so carry an infinite matching weight.
+        Default value is None, in which case nothing is recorded.
 
     Returns
     -------
@@ -223,13 +348,16 @@ def calculate_pij_values(
 
     pij_data: PijData = {}
     edges_for_recalc: list[frozenset[int]] = []
+    undefined: set[frozenset[int]] = set()
+    zero_clamped: set[frozenset[int]] = set()
+    clamped: set[frozenset[int]] = set()
     for key in edges_to_calc:
         if len(key) < max_degree:
             # any edges less than max degree need to be re-calculated
             # taking into account any higher degree edges that affect them
             edges_for_recalc.append(key)
             if len(key) == 1:
-                pij_data[key] = exp_values[key]
+                pij_data[key] = exp_values.get(key, 0.0)
             elif len(key) == 2:
                 pij_data[key] = _calculate_pij_degree_2(key, exp_values)
             elif len(key) == 3:
@@ -238,7 +366,14 @@ def calculate_pij_values(
 
         pij_val = pij_func(key, exp_values)
 
-        pij_data[key] = max(noise_floor_edges.get(key, min_prob), pij_val)
+        pij_data[key] = _apply_floor(
+            pij_val,
+            noise_floor_edges.get(key, min_prob),
+            key,
+            undefined,
+            zero_clamped,
+            clamped,
+        )
 
     # calculate probs by taking into account higher degree edges
     # we work top down, adjusting highest degree first
@@ -247,7 +382,16 @@ def calculate_pij_values(
         # doing this is cheaper than the equivalent tuple checks
         # by a factor of around 8
         adjusted_pi = _calculate_edge_prob_with_higher_degrees(edge, pij_data, min_prob)
-        pij_data[edge] = max(noise_floor_edges.get(edge, min_prob), adjusted_pi)
+        pij_data[edge] = _apply_floor(
+            adjusted_pi,
+            noise_floor_edges.get(edge, min_prob),
+            edge,
+            undefined,
+            zero_clamped,
+            clamped,
+        )
+    _record_pij_diagnostics(diagnostics, undefined, clamped, zero_clamped)
+    _warn_pij_diagnostics(undefined, zero_clamped)
     return pij_data
 
 
@@ -274,6 +418,20 @@ def create_dem_from_pij(
     stim.DetectorErrorModel
         stim.DetectorErrorModel for given pij_data and circuit.
     """
+    invalid = {
+        edge: pij
+        for edge, pij in pij_data.items()
+        if math.isnan(pij) or not 0.0 <= pij <= 1.0
+    }
+    if invalid:
+        msg = (
+            f"{len(invalid)} edge probabilities are undefined or outside [0, 1], "
+            f"e.g. {dict(list(invalid.items())[:3])}. Pij estimates derived from "
+            "too few shots can fall outside this range; increase the shot count, "
+            "or pass min_prob/noise_floor_graph to calculate_pij_values."
+        )
+        raise ValueError(msg)
+
     boundaries = graph.boundaries
     d_graph: HyperMultiGraph
     if isinstance(graph, NXDecodingGraph):
